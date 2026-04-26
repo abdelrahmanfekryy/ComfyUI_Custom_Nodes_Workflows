@@ -1,0 +1,15 @@
+# Ignore everything at root
+*
+!.gitignore
+!AGENTS.md
+!custom_nodes/
+!user/
+
+# Inside custom_nodes: ignore all subdirectories (un-ignore your custom ones with !)
+/custom_nodes/*
+
+# Inside user: ignore everything except workflows
+/user/*
+!/user/default/
+/user/default/*
+!/user/default/workflows/
