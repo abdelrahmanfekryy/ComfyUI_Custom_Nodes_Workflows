@@ -18,12 +18,23 @@ ComfyUI is a node/graph-based UI for Stable Diffusion and other AI models. It us
 - **`models/`** - Model storage directory (checkpoints, VAE, LoRA, etc.)
 - **`tests/`** and **`tests-unit/`** - Test suites
 
+## Python Environment
+
+**Virtual environment**: `.venv/` (at project root `/media/abdelrahman/Data/ComfyUI/.venv/`)
+
+Always use the venv Python for installing packages, running scripts, and linting:
+
+```bash
+.venv/bin/python -m pip install <package>
+.venv/bin/python <script.py>
+```
+
 ## Development Setup
 
 ```bash
 # Python 3.10+ required
-pip install -r requirements.txt
-pip install -r manager_requirements.txt  # For manager features
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r manager_requirements.txt  # For manager features
 ```
 
 ## Running ComfyUI

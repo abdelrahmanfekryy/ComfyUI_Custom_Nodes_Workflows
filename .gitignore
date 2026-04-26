@@ -7,9 +7,12 @@
 
 # Inside custom_nodes: ignore all subdirectories (un-ignore your custom ones with !)
 /custom_nodes/*
+!/custom_nodes/ComfyUI-LightOnOCR-GGUF/
+!/custom_nodes/ComfyUI-LightOnOCR-GGUF/**
 
 # Inside user: ignore everything except workflows
 /user/*
 !/user/default/
 /user/default/*
 !/user/default/workflows/
+!/user/default/workflows/LightOnOCR_GGUF_Workflow.json

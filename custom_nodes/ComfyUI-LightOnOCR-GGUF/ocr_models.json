@@ -1,0 +1,30 @@
+{
+  "base_dir": "llm",
+  "models": {
+    "LightOnOCR-1B-1025": {
+      "repo_id": "noctrex/LightOnOCR-1B-1025-GGUF",
+      "model_files": [
+        "LightOnOCR-1B-1025-Q4_K_S.gguf",
+        "LightOnOCR-1B-1025-Q4_K_M.gguf",
+        "LightOnOCR-1B-1025-Q5_K_S.gguf",
+        "LightOnOCR-1B-1025-Q5_K_M.gguf",
+        "LightOnOCR-1B-1025-Q6_K.gguf",
+        "LightOnOCR-1B-1025-Q8_0.gguf",
+        "LightOnOCR-1B-1025-BF16.gguf",
+        "LightOnOCR-1B-1025-F16.gguf"
+      ],
+      "mmproj_files": [
+        "mmproj-F32.gguf",
+        "mmproj-BF16.gguf",
+        "mmproj-F16.gguf"
+      ],
+      "defaults": {
+        "n_ctx": 8192,
+        "image_max_tokens": 4096,
+        "n_batch": 512,
+        "n_gpu_layers": -1,
+        "image_max_side": 1540
+      }
+    }
+  }
+}
