@@ -22,19 +22,25 @@ ComfyUI is a node/graph-based UI for Stable Diffusion and other AI models. It us
 
 **Virtual environment**: `.venv/` (at project root `/media/abdelrahman/Data/ComfyUI/.venv/`)
 
-Always use the venv Python for installing packages, running scripts, and linting:
+**Package manager**: [uv](https://docs.astral.sh/uv/) (`~/.local/bin/uv`), using its pip interface. `.venv` was created by `uv venv` with uv-managed CPython 3.12. Run uv commands from the project root: uv finds `.venv` automatically. The uv cache is shared by all projects on this machine (`cache-dir = "/media/abdelrahman/Data/.uv-cache"` in `~/.config/uv/uv.toml`). It's on the same drive as `.venv`, so installs are hardlinked from it. Don't add a project `uv.toml` that sets `link-mode = "copy"`. ComfyUI-Manager is also set to install with uv (`use_uv = True` in `user/__manager/config.ini`).
+
+Use uv to install packages and the venv Python to run scripts and linting:
 
 ```bash
-.venv/bin/python -m pip install <package>
+uv pip install <package>
+uv pip list / uv pip show <package> / uv pip check
 .venv/bin/python <script.py>
 ```
+
+- Don't use `uv add` / `uv sync` / `uv lock`. This checkout tracks upstream ComfyUI's `pyproject.toml`, which has no dependency list, and syncing would remove packages installed by custom nodes.
+- torch is the CUDA 12.8 build (`2.10.0+cu128`). To reinstall or change it, pass the index explicitly: `uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128`.
 
 ## Development Setup
 
 ```bash
 # Python 3.10+ required
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m pip install -r manager_requirements.txt  # For manager features
+uv pip install -r requirements.txt
+uv pip install -r manager_requirements.txt  # For manager features
 ```
 
 ## Running ComfyUI
