@@ -1,8 +1,36 @@
 {
   "base_dir": "llm",
   "models": {
+    "LightOnOCR-2-1B": {
+      "repo_id": "noctrex/LightOnOCR-2-1B-GGUF",
+      "source_repo_id": "lightonai/LightOnOCR-2-1B",
+      "model_files": [
+        "LightOnOCR-2-1B-IQ4_XS.gguf",
+        "LightOnOCR-2-1B-IQ4_NL.gguf",
+        "LightOnOCR-2-1B-Q4_K_M.gguf",
+        "LightOnOCR-2-1B-Q5_K_M.gguf",
+        "LightOnOCR-2-1B-Q6_K.gguf",
+        "LightOnOCR-2-1B-Q8_0.gguf",
+        "LightOnOCR-2-1B-BF16.gguf",
+        "LightOnOCR-2-1B-F16.gguf"
+      ],
+      "mmproj_files": [
+        "mmproj-F32.gguf",
+        "mmproj-BF16.gguf",
+        "mmproj-F16.gguf"
+      ],
+      "defaults": {
+        "n_ctx": 8192,
+        "image_max_tokens": 4096,
+        "n_batch": 512,
+        "n_gpu_layers": -1,
+        "image_max_side": 1540
+      }
+    },
     "LightOnOCR-1B-1025": {
       "repo_id": "noctrex/LightOnOCR-1B-1025-GGUF",
+      "source_repo_id": "lightonai/LightOnOCR-1B-1025",
+      "deprecated": true,
       "model_files": [
         "LightOnOCR-1B-1025-Q4_K_S.gguf",
         "LightOnOCR-1B-1025-Q4_K_M.gguf",
@@ -11,7 +39,8 @@
         "LightOnOCR-1B-1025-Q6_K.gguf",
         "LightOnOCR-1B-1025-Q8_0.gguf",
         "LightOnOCR-1B-1025-BF16.gguf",
-        "LightOnOCR-1B-1025-F16.gguf"
+        "LightOnOCR-1B-1025-F16.gguf",
+        "LightOnOCR-1B-1025-F32.gguf"
       ],
       "mmproj_files": [
         "mmproj-F32.gguf",

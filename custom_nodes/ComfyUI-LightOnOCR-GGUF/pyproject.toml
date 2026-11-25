@@ -3,7 +3,7 @@ name = "ComfyUI-LightOnOCR-GGUF"
 description = "ComfyUI nodes for LightOnOCR and Pixtral-based GGUF vision models. Supports OCR, document understanding with llama-cpp-python."
 version = "1.0.0"
 license { file = "LICENSE" }
-dependencies = ["llama-cpp-python"]
+dependencies = ["llama-cpp-python", "pypdfium2"]
 
 [project.urls]
 Repository = "https://github.com/your-user/ComfyUI-LightOnOCR-GGUF"

@@ -1,28 +1,33 @@
 from .nodes import (
     OCRLoadImage,
+    OCRLoadDocument,
     OCRGGUFModelLoader,
     OCRProjectorLoader,
     OCRInference,
     OCRInferenceAdvanced,
-    OCRShowText,
+    OCRDisplayAny,
 )
 
 NODE_CLASS_MAPPINGS = {
     "OCRLoadImage": OCRLoadImage,
+    "OCRLoadDocument": OCRLoadDocument,
     "OCRGGUFModelLoader": OCRGGUFModelLoader,
     "OCRProjectorLoader": OCRProjectorLoader,
     "OCRInference": OCRInference,
     "OCRInferenceAdvanced": OCRInferenceAdvanced,
-    "OCRShowText": OCRShowText,
+    "OCRDisplayAny": OCRDisplayAny,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OCRLoadImage": "📄 Load Image",
+    "OCRLoadDocument": "📄 Load Document (PDF / Image)",
     "OCRGGUFModelLoader": "📄 GGUF Model Loader",
     "OCRProjectorLoader": "📄 Projector Loader",
     "OCRInference": "📄 OCR Inference",
     "OCRInferenceAdvanced": "📄 OCR Inference (Advanced)",
-    "OCRShowText": "📄 Show Text",
+    "OCRDisplayAny": "📄 OCR Display Any",
 }
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+WEB_DIRECTORY = "./web"
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

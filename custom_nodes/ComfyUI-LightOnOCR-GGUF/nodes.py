@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,22 @@ def _resize_for_ocr(pil_img: Image.Image, max_longest: int = 1540) -> Image.Imag
         scale = max_longest / max(w, h)
         pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     return pil_img
+
+
+def _batch_to_b64(image: torch.Tensor | None, max_side: int) -> list[str | None]:
+    """One base64 PNG per image in the batch; [None] for text-only inference."""
+    if image is None:
+        return [None]
+    if image.ndim == 3:
+        image = image.unsqueeze(0)
+    return [_image_to_base64(_resize_for_ocr(_tensor_to_pil(img), max_longest=max_side)) for img in image]
+
+
+def _join_pages(texts: list[str]) -> str:
+    """Join per-page OCR text with a Markdown page break."""
+    if len(texts) == 1:
+        return texts[0]
+    return "\n\n---\n\n".join(f"<!-- page {i} -->\n\n{t}" for i, t in enumerate(texts, 1))
 
 
 # --- Public handle types ---
@@ -226,6 +243,17 @@ def _get_or_load_model(model_path: str, mmproj_path: str, n_ctx: int, n_gpu_laye
     return llm, False
 
 
+# llama.cpp's mtmd wraps LightOnOCR image embeddings in <|im_start|> ... <|im_end|>
+# (tools/mtmd/mtmd.cpp), not the <|vision_pad|>/<|vision_end|> tokens the model was
+# trained with, so the first generated token is often a stray ":" or "." before the text.
+_LEADING_ARTIFACT_RE = re.compile(r"^\s*(?::|\.(?=\s))\s*")
+
+
+def _strip_leading_artifact(text: str) -> str:
+    """Remove a stray leading ':' (or '.' followed by whitespace) and surrounding whitespace."""
+    return _LEADING_ARTIFACT_RE.sub("", text, count=1).strip()
+
+
 def run_inference(
     llm,
     system_prompt: str,
@@ -274,7 +302,7 @@ def run_inference(
         elapsed,
     )
 
-    return content.strip()
+    return _strip_leading_artifact(content)
 
 
 # --- Model Loader Node ---
@@ -395,12 +423,7 @@ class OCRInference:
     CATEGORY = "LightOnOCR"
 
     def execute(self, ocr_model, ocr_projector, prompt, max_tokens, keep_loaded, seed, image=None):
-        if image is not None:
-            pil = _tensor_to_pil(image)
-            pil = _resize_for_ocr(pil)
-            b64 = _image_to_base64(pil)
-        else:
-            b64 = None
+        b64_pages = _batch_to_b64(image, 1540)
 
         llm, _ = _get_or_load_model(
             model_path=ocr_model.model_path,
@@ -412,19 +435,22 @@ class OCRInference:
             keep_loaded=keep_loaded,
         )
 
-        text = run_inference(
-            llm=llm,
-            system_prompt="You are a specialized OCR assistant. Output only the extracted text from the image.",
-            user_prompt=prompt,
-            image_b64=b64,
-            max_tokens=max_tokens,
-            temperature=0.2,
-            top_p=0.9,
-            repetition_penalty=1.1,
-            seed=seed,
-        )
+        texts = [
+            run_inference(
+                llm=llm,
+                system_prompt="You are a specialized OCR assistant. Output only the extracted text from the image.",
+                user_prompt=prompt,
+                image_b64=b64,
+                max_tokens=max_tokens,
+                temperature=0.2,
+                top_p=0.9,
+                repetition_penalty=1.1,
+                seed=seed,
+            )
+            for b64 in b64_pages
+        ]
 
-        return (text,)
+        return (_join_pages(texts),)
 
 
 class OCRInferenceAdvanced(OCRInference):
@@ -587,12 +613,7 @@ class OCRInferenceAdvanced(OCRInference):
         seed,
         image=None,
     ):
-        if image is not None:
-            pil = _tensor_to_pil(image)
-            pil = _resize_for_ocr(pil, max_longest=image_max_side)
-            b64 = _image_to_base64(pil)
-        else:
-            b64 = None
+        b64_pages = _batch_to_b64(image, image_max_side)
 
         llm, _ = _get_or_load_model(
             model_path=ocr_model.model_path,
@@ -604,19 +625,22 @@ class OCRInferenceAdvanced(OCRInference):
             keep_loaded=keep_loaded,
         )
 
-        text = run_inference(
-            llm=llm,
-            system_prompt=system_prompt,
-            user_prompt=prompt,
-            image_b64=b64,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            seed=seed,
-        )
+        texts = [
+            run_inference(
+                llm=llm,
+                system_prompt=system_prompt,
+                user_prompt=prompt,
+                image_b64=b64,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                seed=seed,
+            )
+            for b64 in b64_pages
+        ]
 
-        return (text,)
+        return (_join_pages(texts),)
 
 
 # --- Image Loader Node ---
@@ -661,31 +685,232 @@ class OCRLoadImage:
         return (tensor,)
 
 
-# --- Text Display Node ---
+# --- Document Loader Node (PDF + images, with upload) ---
 
 
-class OCRShowText:
-    """Display extracted text as a widget and save to output directory."""
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif")
+DOCUMENT_EXTS = (".pdf",) + IMAGE_EXTS
+
+
+def _list_input_documents():
+    """All PDFs/images under ComfyUI/input (subfolders included), as relative paths."""
+    input_dir = folder_paths.get_input_directory()
+    files = []
+    for root, _dirs, names in os.walk(input_dir):
+        for name in names:
+            if name.lower().endswith(DOCUMENT_EXTS):
+                rel = os.path.relpath(os.path.join(root, name), input_dir)
+                files.append(rel.replace(os.sep, "/"))
+    return sorted(files)
+
+
+def _parse_pages(spec: str, page_count: int) -> list[int]:
+    """Parse '1', '1-3,5', or 'all' / '' / '0' into 0-based page indices."""
+    spec = (spec or "").strip().lower()
+    if spec in ("", "0", "all", "*"):
+        return list(range(page_count))
+    pages = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            start = int(a) if a.strip() else 1
+            end = int(b) if b.strip() else page_count
+            pages.extend(range(start, end + 1))
+        else:
+            pages.append(int(part))
+    out = []
+    for p in pages:
+        if not 1 <= p <= page_count:
+            raise ValueError(f"Page {p} is out of range: the document has {page_count} page(s).")
+        if p - 1 not in out:
+            out.append(p - 1)
+    return out
+
+
+def _render_pdf(path: str, pages_spec: str, dpi: int) -> tuple[list[Image.Image], int]:
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(path)
+    try:
+        total = len(pdf)
+        images = []
+        for idx in _parse_pages(pages_spec, total):
+            page = pdf[idx]
+            try:
+                images.append(page.render(scale=dpi / 72.0).to_pil().convert("RGB"))
+            finally:
+                page.close()
+        return images, total
+    finally:
+        pdf.close()
+
+
+def _load_raster(path: str, pages_spec: str) -> tuple[list[Image.Image], int]:
+    """Load an image file; multi-frame TIFF/GIF frames count as pages."""
+    from PIL import ImageOps, ImageSequence
+
+    with Image.open(path) as img:
+        frames = [ImageOps.exif_transpose(f.copy()).convert("RGB") for f in ImageSequence.Iterator(img)]
+    return [frames[i] for i in _parse_pages(pages_spec, len(frames))], len(frames)
+
+
+def _pils_to_batch(pils: list[Image.Image]) -> torch.Tensor:
+    """Stack pages into one [B, H, W, C] batch, padding smaller pages with white."""
+    w = max(p.width for p in pils)
+    h = max(p.height for p in pils)
+    batch = []
+    for p in pils:
+        if p.size != (w, h):
+            canvas = Image.new("RGB", (w, h), (255, 255, 255))
+            canvas.paste(p, (0, 0))
+            p = canvas
+        batch.append(torch.from_numpy(np.array(p).astype(np.float32) / 255.0))
+    return torch.stack(batch)
+
+
+class OCRLoadDocument:
+    """Upload/load a PDF or image for OCR. PDF pages are rendered to images."""
 
     @classmethod
     def INPUT_TYPES(cls):
+        files = _list_input_documents() or ["(upload a PDF or image)"]
         return {
             "required": {
-                "text": ("STRING", {"forceInput": True, "multiline": True}),
+                "document": (files, {
+                    "tooltip": "PDF or image in ComfyUI/input/. Use the upload button or drop a file on the node.",
+                }),
+                "pages": ("STRING", {
+                    "default": "all",
+                    "tooltip": "Pages to load (1-based): 'all', '1', '2-4', '1,3,5-7'. Applies to PDFs and multi-frame TIFF/GIF.",
+                }),
+                "dpi": ("INT", {
+                    "default": 200, "min": 72, "max": 600, "step": 1,
+                    "tooltip": "Render resolution for PDF pages. 200 is a good default for OCR.",
+                }),
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("image", "page_count")
+    OUTPUT_TOOLTIPS = (
+        "Selected pages as an image batch (one image per page).",
+        "Total number of pages in the document.",
+    )
     FUNCTION = "execute"
     CATEGORY = "LightOnOCR"
+    OUTPUT_NODE = True  # so the rendered page preview shows on the node
+
+    @staticmethod
+    def _path(document):
+        return folder_paths.get_annotated_filepath(document)
+
+    @classmethod
+    def IS_CHANGED(cls, document, pages, dpi):
+        import hashlib
+        path = cls._path(document)
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return f"{h.hexdigest()}|{pages}|{dpi}"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, document, pages):
+        if not folder_paths.exists_annotated_filepath(document):
+            return f"File not found: {document}"
+        if not document.lower().endswith(DOCUMENT_EXTS):
+            return f"Unsupported file type: {document}"
+        if any(c not in "0123456789,- " for c in pages.strip().lower()) and pages.strip().lower() not in ("all", "*"):
+            return f"Invalid pages value: {pages!r}. Use 'all', '1', '2-4' or '1,3,5-7'."
+        return True
+
+    def execute(self, document, pages, dpi):
+        path = self._path(document)
+        if path.lower().endswith(".pdf"):
+            pils, total = _render_pdf(path, pages, dpi)
+        else:
+            pils, total = _load_raster(path, pages)
+        if not pils:
+            raise ValueError(f"No pages selected from {document} (pages={pages!r}).")
+
+        # Page previews for the node UI (first 16 pages).
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        stem = "ocr_doc_" + "".join(c if c.isalnum() else "_" for c in Path(document).stem)[:40]
+        previews = []
+        for i, p in enumerate(pils[:16]):
+            name = f"{stem}_{int(time.time() * 1000)}_{i}.png"
+            thumb = p.copy()
+            thumb.thumbnail((1024, 1024))
+            thumb.save(os.path.join(temp_dir, name), compress_level=1)
+            previews.append({"filename": name, "subfolder": "", "type": "temp"})
+
+        logger.info("Loaded %s: %d of %d page(s)", document, len(pils), total)
+        return {"ui": {"images": previews}, "result": (_pils_to_batch(pils), total)}
+
+
+# --- Text Display Node ---
+
+def get_dict_value(data: dict, dict_key: str, default=None):
+  """Gets a deeply nested value given a dot-delimited key."""
+  keys = dict_key.split('.')
+  key = keys.pop(0) if len(keys) > 0 else None
+  found = data[key] if key in data else None
+  if found is not None and len(keys) > 0:
+    return get_dict_value(found, '.'.join(keys), default)
+  return found if found is not None else default
+
+
+class AnyType(str):
+  """A special class that is always equal in not equal comparisons. Credit to pythongosssss"""
+
+  def __ne__(self, __value: object) -> bool:
+    return False
+  
+any_type = AnyType("*")
+
+class OCRDisplayAny:
+    """Display any data type in the UI."""
+
+    @classmethod
+    def INPUT_TYPES(cls):  # pylint: disable = invalid-name, missing-function-docstring
+        return {
+            "required": {
+                "source": (any_type, {}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+            }
+
+    RETURN_TYPES = ()
+    FUNCTION = "main"
     OUTPUT_NODE = True
 
-    def execute(self, text):
-        output_dir = folder_paths.get_output_directory()
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filepath = os.path.join(output_dir, f"ocr_result_{timestamp}.txt")
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(text)
-        logger.info("Text saved to: %s", filepath)
-        return {"ui": {"text": [text]}, "result": (text,)}
+    def main(self, source=None, unique_id=None, extra_pnginfo=None):
+        value = 'None'
+        if isinstance(source, str):
+            value = source
+        elif isinstance(source, (int, float, bool)):
+            value = str(source)
+        elif source is not None:
+            try:
+                value = json.dumps(source)
+            except Exception:
+                try:
+                    value = str(source)
+                except Exception:
+                    value = 'source exists, but could not be serialized.'
+
+        # Save the output to the pnginfo so it's pre-filled when loading the data.
+        if extra_pnginfo and unique_id:
+            for node in get_dict_value(extra_pnginfo, 'workflow.nodes', []):
+                if str(node['id']) == str(unique_id):
+                    node['widgets_values'] = [value]
+                    break
+
+        return {"ui": {"text": (value,)}}
