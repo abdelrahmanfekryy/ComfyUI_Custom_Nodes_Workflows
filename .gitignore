@@ -16,3 +16,6 @@
 /user/default/*
 !/user/default/workflows/
 !/user/default/workflows/LightOnOCR_GGUF_Workflow.json
+
+# Python bytecode caches (must stay after the ! rules above to take effect)
+__pycache__/
