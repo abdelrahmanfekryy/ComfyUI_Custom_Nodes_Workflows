@@ -256,8 +256,7 @@ def _strip_leading_artifact(text: str) -> str:
 
 def run_inference(
     llm,
-    system_prompt: str,
-    user_prompt: str,
+    user_prompt: str | None,
     image_b64: str | None,
     max_tokens: int,
     temperature: float,
@@ -272,8 +271,7 @@ def run_inference(
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-                    {"type": "text", "text": user_prompt},
-                ],
+                ] + ([{"type": "text", "text": user_prompt}] if user_prompt and user_prompt.strip() else []),
             }
         ]
     else:
@@ -438,7 +436,6 @@ class OCRInference:
         texts = [
             run_inference(
                 llm=llm,
-                system_prompt="You are a specialized OCR assistant. Output only the extracted text from the image.",
                 user_prompt=prompt,
                 image_b64=b64,
                 max_tokens=max_tokens,
@@ -454,7 +451,12 @@ class OCRInference:
 
 
 class OCRInferenceAdvanced(OCRInference):
-    """Run OCR inference with all parameters exposed."""
+    """Run LightOnOCR with sampling and runtime settings exposed.
+
+    LightOnOCR is trained on the image alone, so there are no prompt inputs: it
+    always transcribes the full page to Markdown. Image resolution isn't exposed
+    either: llama.cpp rescales every page to a 1540px longest edge (~2,150 image tokens).
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -462,22 +464,7 @@ class OCRInferenceAdvanced(OCRInference):
             "required": {
                 "ocr_model": ("OCR_MODEL", {"tooltip": "Loaded GGUF model from OCRGGUFModelLoader."}),
                 "ocr_projector": ("OCR_PROJECTOR", {"tooltip": "Loaded mmproj projector from OCRProjectorLoader."}),
-                "system_prompt": (
-                    "STRING",
-                    {
-                        "default": "You are a specialized OCR assistant. Output only the extracted text from the image.",
-                        "multiline": True,
-                        "tooltip": "System instruction that defines the model's behavior.",
-                    },
-                ),
-                "prompt": (
-                    "STRING",
-                    {
-                        "default": "Extract all text from this document. Preserve layout and formatting.",
-                        "multiline": True,
-                        "tooltip": "The OCR prompt sent to the model.",
-                    },
-                ),
+                "image": ("IMAGE", {"tooltip": "Page(s) to OCR. Each image in the batch is read separately."}),
                 "max_tokens": (
                     "INT",
                     {
@@ -485,7 +472,7 @@ class OCRInferenceAdvanced(OCRInference):
                         "min": 256,
                         "max": 32768,
                         "step": 256,
-                        "tooltip": "Maximum number of tokens to generate.",
+                        "tooltip": "Maximum number of tokens to generate per page. Must fit in n_ctx together with the ~2,150 image tokens.",
                     },
                 ),
                 "temperature": (
@@ -495,7 +482,7 @@ class OCRInferenceAdvanced(OCRInference):
                         "min": 0.0,
                         "max": 2.0,
                         "step": 0.05,
-                        "tooltip": "Sampling temperature. Lower = more deterministic. Higher = more creative.",
+                        "tooltip": "Sampling temperature. 0 = deterministic (seed has no effect). LightOnOCR recommends 0.2.",
                     },
                 ),
                 "top_p": (
@@ -515,27 +502,27 @@ class OCRInferenceAdvanced(OCRInference):
                         "min": 0.5,
                         "max": 2.0,
                         "step": 0.05,
-                        "tooltip": "Penalty for repeating tokens. Values > 1.0 reduce repetition.",
+                        "tooltip": "Penalty for repeating tokens. Values > 1.0 reduce repetition loops; too high can drop repeated words.",
                     },
                 ),
                 "n_ctx": (
                     "INT",
                     {
                         "default": 8192,
-                        "min": 2048,
+                        "min": 4096,
                         "max": 131072,
                         "step": 1024,
-                        "tooltip": "Context window size. Larger values allow longer context but use more memory.",
+                        "tooltip": "Context window per page: ~2,150 image tokens + max_tokens. Larger uses more memory.",
                     },
                 ),
                 "n_batch": (
                     "INT",
                     {
                         "default": 512,
-                        "min": 64,
+                        "min": 512,
                         "max": 32768,
                         "step": 64,
-                        "tooltip": "Batch size for prompt processing. Larger batches process faster but use more memory.",
+                        "tooltip": "Batch size for processing the image and prompt. Larger is faster but uses more memory.",
                     },
                 ),
                 "n_gpu_layers": (
@@ -545,26 +532,6 @@ class OCRInferenceAdvanced(OCRInference):
                         "min": -1,
                         "max": 200,
                         "tooltip": "Number of layers to offload to GPU. -1 = all layers, 0 = CPU only.",
-                    },
-                ),
-                "image_max_tokens": (
-                    "INT",
-                    {
-                        "default": 4096,
-                        "min": 256,
-                        "max": 1024000,
-                        "step": 256,
-                        "tooltip": "Maximum image tokens for vision encoding. Higher = more detail, more memory.",
-                    },
-                ),
-                "image_max_side": (
-                    "INT",
-                    {
-                        "default": 1540,
-                        "min": 512,
-                        "max": 4096,
-                        "step": 10,
-                        "tooltip": "Max longest side for image resizing before OCR.",
                     },
                 ),
                 "keep_loaded": (
@@ -580,12 +547,9 @@ class OCRInferenceAdvanced(OCRInference):
                         "default": 42,
                         "min": 1,
                         "max": 0xFFFFFFFF,
-                        "tooltip": "Random seed for reproducible outputs.",
+                        "tooltip": "Random seed for sampling. Has no effect when temperature is 0.",
                     },
                 ),
-            },
-            "optional": {
-                "image": ("IMAGE", {"tooltip": "Image to perform OCR on. If omitted, runs text-only inference."}),
             },
         }
 
@@ -598,8 +562,7 @@ class OCRInferenceAdvanced(OCRInference):
         self,
         ocr_model,
         ocr_projector,
-        system_prompt,
-        prompt,
+        image,
         max_tokens,
         temperature,
         top_p,
@@ -607,13 +570,10 @@ class OCRInferenceAdvanced(OCRInference):
         n_ctx,
         n_batch,
         n_gpu_layers,
-        image_max_tokens,
-        image_max_side,
         keep_loaded,
         seed,
-        image=None,
     ):
-        b64_pages = _batch_to_b64(image, image_max_side)
+        b64_pages = _batch_to_b64(image, 1540)
 
         llm, _ = _get_or_load_model(
             model_path=ocr_model.model_path,
@@ -621,15 +581,14 @@ class OCRInferenceAdvanced(OCRInference):
             n_ctx=n_ctx,
             n_gpu_layers=n_gpu_layers,
             n_batch=n_batch,
-            image_max_tokens=image_max_tokens,
+            image_max_tokens=4096,
             keep_loaded=keep_loaded,
         )
 
         texts = [
             run_inference(
                 llm=llm,
-                system_prompt=system_prompt,
-                user_prompt=prompt,
+                user_prompt=None,
                 image_b64=b64,
                 max_tokens=max_tokens,
                 temperature=temperature,
