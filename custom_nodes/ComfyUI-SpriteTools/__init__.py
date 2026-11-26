@@ -1,4 +1,4 @@
-"""Sprite tools: turn a generated looping video into evenly spaced sprite frames."""
+"""Sprite tools: pose-controlled loop videos and evenly spaced, seamlessly looping sprite frames."""
 import logging
 import math
 
@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from typing_extensions import override
 
 from comfy_api.latest import ComfyExtension, io
+
+from .iclora import AddICLoRAGuideLTX, CropGuidesLTX, ICLoRALoaderLTX
+from .pose_loop import SpritePoseLoop
 
 THUMB = 64  # long side of the thumbnails used to compare poses
 
@@ -90,7 +93,7 @@ class SpriteLoopFrames(io.ComfyNode):
 class SpriteToolsExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [SpriteLoopFrames]
+        return [SpriteLoopFrames, SpritePoseLoop, ICLoRALoaderLTX, AddICLoRAGuideLTX, CropGuidesLTX]
 
 
 async def comfy_entrypoint() -> SpriteToolsExtension:

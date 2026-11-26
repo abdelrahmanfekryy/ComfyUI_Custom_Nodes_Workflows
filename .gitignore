@@ -23,6 +23,7 @@
 !/user/default/workflows/LightOnOCR_GGUF_Workflow.json
 !/user/default/workflows/image_qwen_image_edit_2511.json
 !/user/default/workflows/LTX Sprite Sheet Generator.json
+!/user/default/workflows/LTX Pose Sprite Sheet.json
 
 # Python bytecode caches (must stay after the ! rules above to take effect)
 __pycache__/
