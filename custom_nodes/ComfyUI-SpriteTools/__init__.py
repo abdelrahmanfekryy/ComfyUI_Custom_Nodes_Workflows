@@ -15,6 +15,7 @@ THUMB = 64  # long side of the thumbnails used to compare poses
 
 LOOP_AUTO = "auto (find loop point)"
 LOOP_WHOLE = "whole clip"
+LOOP_RANGE = "pose cycle (loop_start/loop_end)"
 
 
 def _thumbs(images: torch.Tensor) -> torch.Tensor:
@@ -29,8 +30,9 @@ class SpriteLoopFrames(io.ComfyNode):
     """Pick N evenly spaced frames covering exactly one cycle of a looping action.
 
     Video models rarely land the last frame exactly on the first, so in auto mode the cycle ends at the
-    frame that looks most like frame 0 (searched after `min_cycle` of the clip). Frames are then sampled
-    evenly over [0, loop_end), so the sprite wraps from the last kept frame back to the first without a jump.
+    frame that looks most like frame 0 (searched after `min_cycle` of the clip). In pose-cycle mode the range
+    comes from Sprite Pose Loop, which knows where its complete cycle lies. Frames are then sampled evenly
+    over [loop_start, loop_end), so the sprite wraps from the last kept frame back to the first without a jump.
     """
 
     @classmethod
@@ -44,14 +46,21 @@ class SpriteLoopFrames(io.ComfyNode):
             inputs=[
                 io.Image.Input("images", tooltip="Video frames, starting at the reference pose."),
                 io.Int.Input("sprite_frames", default=8, min=1, max=256, tooltip="How many frames to keep."),
-                io.Combo.Input("loop_mode", options=[LOOP_AUTO, LOOP_WHOLE], default=LOOP_AUTO,
+                io.Combo.Input("loop_mode", options=[LOOP_AUTO, LOOP_WHOLE, LOOP_RANGE], default=LOOP_AUTO,
                                tooltip="auto: end the cycle at the frame most similar to frame 0. "
-                                       "whole clip: use every frame but the last (which repeats the first)."),
+                                       "whole clip: use every frame but the last (which repeats the first). "
+                                       "pose cycle: use the complete cycle given by loop_start/loop_end "
+                                       "(connect them from Sprite Pose Loop)."),
                 io.Float.Input("min_cycle", default=0.3, min=0.05, max=1.0, step=0.05,
                                tooltip="Earliest loop point, as a fraction of the clip. Stops it from matching "
                                        "the frames right after the start, which always look like frame 0."),
                 io.Float.Input("fps", default=24.0, min=1.0, max=240.0, step=1.0,
                                tooltip="Frame rate of the source video (connect GetVideoComponents fps)."),
+                io.Int.Input("loop_start", default=0, min=0, max=100000, optional=True,
+                             tooltip="pose cycle mode: first frame of the cycle."),
+                io.Int.Input("loop_end", default=0, min=0, max=100000, optional=True,
+                             tooltip="pose cycle mode: frame where the cycle has come full circle (not kept). "
+                                     "0 = last frame."),
             ],
             outputs=[
                 io.Image.Output(display_name="frames"),
@@ -63,29 +72,38 @@ class SpriteLoopFrames(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images, sprite_frames, loop_mode, min_cycle, fps) -> io.NodeOutput:
+    def execute(cls, images, sprite_frames, loop_mode, min_cycle, fps, loop_start=0, loop_end=0) -> io.NodeOutput:
         count = images.shape[0]
         if count < 3:
             return io.NodeOutput(images, count, float(fps), f"only {count} frame(s), kept all")
 
-        if loop_mode == LOOP_AUTO:
+        start = 0
+        if loop_mode == LOOP_RANGE:
+            end = loop_end if 0 < loop_end < count else count - 1
+            start = min(loop_start, end - 1)
+            mode_info = f"pose cycle, frames {start}-{end - 1}"
+            if end != loop_end:
+                mode_info += f" (loop_end {loop_end} is outside the {count}-frame clip, used the last frame)"
+            loop_end = end
+        elif loop_mode == LOOP_AUTO:
             t = _thumbs(images)
             diff = (t - t[:1]).abs().mean(dim=(1, 2, 3))  # 0..1 per frame
-            start = min(max(2, math.ceil(min_cycle * (count - 1))), count - 1)
-            loop_end = start + int(torch.argmin(diff[start:]).item())
+            search = min(max(2, math.ceil(min_cycle * (count - 1))), count - 1)
+            loop_end = search + int(torch.argmin(diff[search:]).item())
             score = float(diff[loop_end]) * 255
             mode_info = f"loop point at frame {loop_end} (difference to frame 0: {score:.1f}/255)"
         else:
             loop_end = count - 1
             mode_info = f"whole clip, frames 0-{loop_end - 1}"
 
-        n = min(sprite_frames, loop_end)
-        idx = [math.floor(i * loop_end / n) for i in range(n)]
+        length = loop_end - start
+        n = min(sprite_frames, length)
+        idx = [start + math.floor(i * length / n) for i in range(n)]
         frames = images[idx]
-        playback_fps = float(fps) * n / loop_end
+        playback_fps = float(fps) * n / length
         info = f"{mode_info}; kept {n} frames {idx}; play at {playback_fps:.2f} fps for real-time speed"
         if n < sprite_frames:
-            info += f" (asked for {sprite_frames}, cycle has only {loop_end} frames)"
+            info += f" (asked for {sprite_frames}, cycle has only {length} frames)"
         logging.info("SpriteLoopFrames: %s", info)
         return io.NodeOutput(frames, loop_end, playback_fps, info)
 

@@ -1,9 +1,12 @@
 """Animate a character's own DWPose skeleton into a looping pose video (OpenPose-style render).
 
 Because the skeleton comes from the character's reference image, the pose video matches its proportions
-and position exactly, and frame 0 is the reference pose. The last frame equals the first, so the
-generated clip loops.
+and position exactly, and frame 0 is the reference pose. The cycle starts at the phase closest to the
+reference pose; when that still differs (side walk/run), a short lead-in eases from the reference into the
+motion. Every cycle after the lead-in is complete, and the last frame equals the start of the last cycle,
+so the generated clip loops.
 """
+import logging
 import math
 
 import cv2
@@ -26,6 +29,8 @@ HAND_EDGES = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8), (0
 R_SHO, R_ELB, R_WRI, L_SHO, L_ELB, L_WRI = 2, 3, 4, 5, 6, 7
 R_HIP, R_KNE, R_ANK, L_HIP, L_KNE, L_ANK = 8, 9, 10, 11, 12, 13
 UPPER = [0, 1, 2, 3, 4, 5, 6, 7, 14, 15, 16, 17]
+
+MATCH_TOLERANCE = 0.02  # max joint offset (fraction of body height) that counts as the reference pose
 
 MOTIONS = ["march in place", "walk in place (side view)", "run in place (side view)", "idle (breathing)"]
 
@@ -165,25 +170,38 @@ class SpritePoseLoop(io.ComfyNode):
             category="image/sprites",
             description="Animates the skeleton detected on the character reference (DWPose) into a looping pose "
                         "video, drawn OpenPose-style, for pose-controlled video models. The skeleton keeps the "
-                        "character's own proportions and position; the last frame equals the first.",
+                        "character's own proportions and position. Frame 0 is the reference pose; motions that "
+                        "never pass through it (side walk/run) get a lead-in first. loop_start/loop_end mark the "
+                        "last complete cycle, for Sprite Loop Frames.",
             inputs=[
                 io.Custom("POSE_KEYPOINT").Input("pose_keypoint", tooltip="DWPose output for the reference image."),
                 io.Combo.Input("motion", options=MOTIONS, default=MOTIONS[0],
                                tooltip="Side-view motions need a side-view reference; march and idle suit any."),
                 io.Int.Input("frames", default=49, min=9, max=1025, step=8,
-                             tooltip="Clip length. Rounded down to 8n+1 for LTX."),
-                io.Int.Input("cycles", default=1, min=1, max=16, tooltip="Motion cycles in the clip."),
+                             tooltip="Clip length, lead-in included. Rounded down to 8n+1 for LTX."),
+                io.Int.Input("cycles", default=1, min=1, max=16, tooltip="Motion cycles after the lead-in."),
                 io.Float.Input("amplitude", default=1.0, min=0.0, max=2.0, step=0.05,
                                tooltip="Scales the swing of legs and arms."),
+                io.Int.Input("lead_in", default=8, min=0, max=256, optional=True,
+                             tooltip="Frames that ease from the reference pose into the motion, used only when the "
+                                     "motion never passes through the reference pose (side walk/run). They come "
+                                     "before the cycles and are left out of the sprite."),
             ],
             outputs=[
                 io.Image.Output(display_name="pose_frames"),
                 io.Int.Output(display_name="frames"),
+                io.Int.Output(display_name="loop_start", tooltip="First frame of the last complete cycle."),
+                io.Int.Output(display_name="loop_end", tooltip="Frame where that cycle has come full circle (its "
+                                                               "pose equals loop_start's; not part of the sprite)."),
+                io.Int.Output(display_name="image_guides",
+                              tooltip="Reference image guides to use: 2 (first and last frame) when the clip ends "
+                                      "on the reference pose, else 1 (first frame only)."),
+                io.String.Output(display_name="info"),
             ],
         )
 
     @classmethod
-    def execute(cls, pose_keypoint, motion, frames, cycles, amplitude) -> io.NodeOutput:
+    def execute(cls, pose_keypoint, motion, frames, cycles, amplitude, lead_in=8) -> io.NodeOutput:
         frames = (frames - 1) // 8 * 8 + 1
         data = pose_keypoint[0] if isinstance(pose_keypoint, list) else pose_keypoint
         w, h = int(data["canvas_width"]), int(data["canvas_height"])
@@ -200,8 +218,30 @@ class SpritePoseLoop(io.ComfyNode):
         rig = _Rig(body, valid, face if face[0] is not None else None,
                    [hd if hd[0] is not None else None for hd in hands])
 
+        # start the cycle at the phase that looks most like the reference
+        def offset(t):
+            return float(np.abs(rig.pose(motion, t, amplitude) - body)[valid].max()) / rig.size
+        phase0 = min((k / 64 for k in range(64)), key=offset)
+        gap = offset(phase0)
+        lead = 0 if gap <= MATCH_TOLERANCE else min(lead_in, frames - 9)
+        span = frames - 1 - lead  # frames covered by the cycles; frame `frames - 1` repeats the cycle start
+
         out = []
         for i in range(frames):
-            t = (i * cycles / (frames - 1)) % 1.0
-            out.append(rig.render(rig.pose(motion, t, amplitude), w, h))
-        return io.NodeOutput(torch.from_numpy(np.stack(out)).float() / 255.0, frames)
+            t = (phase0 + (i - lead) * cycles / span) % 1.0
+            p = rig.pose(motion, t, amplitude)
+            if i < lead:  # ease out of the reference pose into the already-moving cycle
+                x = i / lead
+                k = x * x * (3 - 2 * x)
+                p = body + (p - body) * k
+            out.append(rig.render(p, w, h))
+
+        loop_end = frames - 1
+        loop_start = loop_end - round(span / cycles)
+        guides = 2 if lead == 0 else 1
+        info = (f"{motion}: {frames} frames, lead-in {lead}, {cycles} cycle(s) of {span / cycles:g} frames; "
+                f"sprite cycle = frames {loop_start}-{loop_end - 1}; "
+                f"start pose offset from reference {gap * 100:.1f}% of body height; image guides: {guides}")
+        logging.info("SpritePoseLoop: %s", info)
+        return io.NodeOutput(torch.from_numpy(np.stack(out)).float() / 255.0, frames, loop_start, loop_end, guides,
+                             info)
