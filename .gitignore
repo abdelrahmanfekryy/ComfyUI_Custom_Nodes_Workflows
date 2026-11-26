@@ -11,6 +11,8 @@
 !/custom_nodes/ComfyUI-LightOnOCR-GGUF/**
 !/custom_nodes/ComfyUI-QwenImageEditMulti/
 !/custom_nodes/ComfyUI-QwenImageEditMulti/**
+!/custom_nodes/ComfyUI-SpriteTools/
+!/custom_nodes/ComfyUI-SpriteTools/**
 
 # Inside user: ignore everything except workflows
 /user/*
@@ -19,6 +21,7 @@
 !/user/default/workflows/
 !/user/default/workflows/LightOnOCR_GGUF_Workflow.json
 !/user/default/workflows/image_qwen_image_edit_2511.json
+!/user/default/workflows/LTX Sprite Sheet Generator.json
 
 # Python bytecode caches (must stay after the ! rules above to take effect)
 __pycache__/
