@@ -2,6 +2,7 @@
 *
 !.gitignore
 !AGENTS.md
+!run.sh
 !custom_nodes/
 !user/
 
