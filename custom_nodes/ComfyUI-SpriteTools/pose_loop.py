@@ -2,7 +2,9 @@
 
 The motion is either procedural (march, side walk/run, idle) or taken from a driving video: DWPose runs on
 every video frame and the motion is retargeted onto the character's own skeleton. Limbs follow the video's
-bone directions, but bone lengths, torso and head shape stay the character's. Either way, the pose video
+bone directions, but bone lengths, torso and head shape stay the character's (or, with video_body "motion's
+skeleton", the motion's own skeleton is used, scaled to the character: for a video seen from another view than
+the reference, where limb directions alone don't carry over). Either way, the pose video
 matches the character's proportions and position, and frame 0 is the reference pose. The cycle starts at
 the phase closest to the reference pose. When that still differs, a short lead-in eases from the reference
 into the motion. Every cycle after the lead-in is complete, and the last frame equals the start of the last
@@ -57,6 +59,11 @@ CYCLE_WHOLE = "whole video is one cycle"
 TIMING_NATURAL = "natural speed (sets frames)"
 TIMING_FIT = "fit to frames"
 MIRROR_AUTO, MIRROR_OFF, MIRROR_ON = "auto (match facing)", "off", "on"
+BODY_CHARACTER = "character (retarget)"
+BODY_MOTION = "motion's skeleton"
+# torso width (shoulders + hips, across the image) over torso length: about 1 seen from the front, 0.1-0.3 from
+# the side. Below SIDE_WIDTH is a side view, above FRONT_WIDTH a front or back view.
+SIDE_WIDTH, FRONT_WIDTH = 0.4, 0.6
 
 MISSING = object()  # an unconnected optional input, as opposed to a connected one that is not evaluated yet
 
@@ -276,6 +283,18 @@ def _video_track(video_pose):
     return out, width
 
 
+def _torso_width(p):
+    """Torso width over torso length for (..., 18, 2) keypoints (NaN where a joint is missing)."""
+    root = (p[..., R_HIP, :] + p[..., L_HIP, :]) / 2
+    spine = np.linalg.norm(p[..., NECK, :] - root, axis=-1)
+    width = np.abs(p[..., R_SHO, 0] - p[..., L_SHO, 0]) + np.abs(p[..., R_HIP, 0] - p[..., L_HIP, 0])
+    return width / np.maximum(spine, 1e-6)
+
+
+def _view(width):
+    return "side" if width < SIDE_WIDTH else "front/back" if width > FRONT_WIDTH else None
+
+
 def _is_saved_motion(video_pose):
     first = video_pose[0] if isinstance(video_pose, list) and video_pose else video_pose
     return isinstance(first, dict) and bool((first.get("sprite_motion") or {}).get("cycle"))
@@ -452,8 +471,9 @@ def _sample(x, pos):
 class _VideoMotion:
     """A driving video's motion retargeted onto the character's rig, as one loopable cycle."""
 
-    def __init__(self, rig, video_pose, mirror, smoothing, amplitude, cycle_mode, pin_feet):
+    def __init__(self, rig, video_pose, mirror, smoothing, amplitude, cycle_mode, pin_feet, body=BODY_CHARACTER):
         self.rig = rig
+        self.body = body
         self.pin_feet = pin_feet
         self.no_cycle = None
         # a saved motion (Sprite Motion from Video) is already smoothed and is exactly one cycle
@@ -566,6 +586,19 @@ class _VideoMotion:
                     p[b] = p[a] + _rotate(b0[b] - b0[a], turn)
             self.rel[i] = p
 
+        # Front vs side: limb directions from one view, put on a torso seen from the other, give a different
+        # motion (a side walk's leg swing becomes legs crossing in front of a front-facing body).
+        ref_view = _view(float(_torso_width(rig.body0))) if rig.valid[[NECK, R_SHO, L_SHO, R_HIP, L_HIP]].all() else None
+        widths = _torso_width(v)
+        vid_view = _view(float(np.nanmedian(widths))) if np.isfinite(widths).any() else None
+        self.view_mismatch = (vid_view, ref_view) if ref_view and vid_view and ref_view != vid_view else None
+
+        if body == BODY_MOTION:
+            # the motion's own skeleton, scaled to the character's legs and standing where the character stands;
+            # joints it never shows keep the retargeted (character's) ones
+            own = (v - vroot[:, None, :]) * self.ratio
+            self.rel = np.where(np.isfinite(own), own, self.rel)
+
         q = self.rel.copy()
         q[..., 1] -= self.height[:, None]  # include how high the body is
         self.desc = q[:, rig.valid] / rig.size  # pose descriptor for matching, in body heights
@@ -575,7 +608,7 @@ class _VideoMotion:
         if self.no_cycle is not None and not self.cyclic:
             # No repeat inside the clip. If, cleaned up as one loop (left/right fixes and gap filling wrapping
             # around), its end leads back into its start, then the clip is one loop: use that.
-            loop = _VideoMotion(rig, video_pose, mirror, smoothing, amplitude, CYCLE_WHOLE, pin_feet)
+            loop = _VideoMotion(rig, video_pose, mirror, smoothing, amplitude, CYCLE_WHOLE, pin_feet, body)
             if loop.loops_back:
                 self.__dict__.update(loop.__dict__)
                 self.auto_loop = True
@@ -748,7 +781,8 @@ class SpritePoseLoop(io.ComfyNode):
                              tooltip="Frames that ease from the reference pose into the motion, used only when the "
                                      "motion never passes through the reference pose (side walk/run, most "
                                      "videos, or a moved skeleton). They come before the cycles and are left "
-                                     "out of the sprite."),
+                                     "out of the sprite. With a video at natural speed it can grow by a few "
+                                     "frames, so the cycles keep the motion's exact length."),
                 io.Float.Input("scale", default=1.0, min=0.1, max=4.0, step=0.01, optional=True,
                                tooltip="Skeleton size, around the character's feet. Below 1 leaves room for "
                                        "wide arm swings or jumps."),
@@ -777,6 +811,14 @@ class SpritePoseLoop(io.ComfyNode):
                 io.Boolean.Input("pin_feet", default=False, optional=True,
                                  tooltip="Video: keep the lower foot on the ground in every frame. Removes jumps "
                                          "and foot drift."),
+                io.Combo.Input("video_body", options=[BODY_CHARACTER, BODY_MOTION], default=BODY_CHARACTER,
+                               optional=True,
+                               tooltip="Video: whose skeleton moves. character = the video's limb directions on "
+                                       "the character's own torso and bone lengths (needs the same view as the "
+                                       "reference: front with front, side with side). motion's skeleton = the "
+                                       "motion exactly as saved, only scaled to the character's height and "
+                                       "placed at its feet (amplitude has no effect); use it when the views "
+                                       "differ, e.g. a side walk for a front-facing reference."),
             ],
             outputs=[
                 io.Image.Output(display_name="pose_frames"),
@@ -803,7 +845,8 @@ class SpritePoseLoop(io.ComfyNode):
     @classmethod
     def execute(cls, pose_keypoint, motion, frames, cycles, amplitude, lead_in=8, reference=None, video_pose=None,
                 scale=1.0, offset_x=0.0, offset_y=0.0, transform_reference=True, video_cycle=CYCLE_DETECT,
-                video_timing=TIMING_NATURAL, mirror=MIRROR_AUTO, smoothing=1.0, pin_feet=False) -> io.NodeOutput:
+                video_timing=TIMING_NATURAL, mirror=MIRROR_AUTO, smoothing=1.0, pin_feet=False,
+                video_body=BODY_CHARACTER) -> io.NodeOutput:
         frames = (frames - 1) // 8 * 8 + 1
         data = pose_keypoint[0] if isinstance(pose_keypoint, list) else pose_keypoint
         w, h = int(data["canvas_width"]), int(data["canvas_height"])
@@ -826,7 +869,7 @@ class SpritePoseLoop(io.ComfyNode):
                 raise ValueError("motion is 'from video' but there is no motion: pick a file in Load Sprite "
                                  "Motion (make one with the Sprite Motion from Video workflow), or connect "
                                  "DWPose on a video's frames to video_pose")
-            vm = _VideoMotion(rig, video_pose, mirror, smoothing, amplitude, video_cycle, pin_feet)
+            vm = _VideoMotion(rig, video_pose, mirror, smoothing, amplitude, video_cycle, pin_feet, video_body)
             pose_at = vm.pose
             steps = vm.samples  # phases to try when looking for the reference pose
             if vm.saved:
@@ -844,7 +887,14 @@ class SpritePoseLoop(io.ComfyNode):
             if vm.no_cycle is not None:
                 cycle += (f"; no repeating cycle found ({vm.no_cycle}), so the whole video is used as one cycle: "
                           f"trim it to one cycle, or use a clip with several")
+            if video_body == BODY_MOTION:
+                cycle += "; body: the motion's own skeleton"
             notes.append(cycle)
+            if vm.view_mismatch and video_body == BODY_CHARACTER:
+                notes.append(f"WARNING: the motion is a {vm.view_mismatch[0]} view but the reference is a "
+                             f"{vm.view_mismatch[1]} view, so retargeted limbs move differently from the motion. "
+                             f"Use a {vm.view_mismatch[0]}-view reference, or set video_body to "
+                             f"\"{BODY_MOTION}\" (the character then turns during the lead-in)")
         else:
             def pose_at(t):
                 return rig.pose(motion, t, amplitude)
@@ -867,7 +917,13 @@ class SpritePoseLoop(io.ComfyNode):
         gap = offset(phase0)
         lead = 0 if gap <= MATCH_TOLERANCE else lead_in
         if motion == VIDEO and video_timing == TIMING_NATURAL:
-            frames = max(9, min(1025, round((lead + cycles * vm.samples) / 8) * 8 + 1))
+            span = cycles * vm.samples
+            frames = max(9, min(1025, round((lead + span) / 8) * 8 + 1))
+            if lead and frames - 1 - span < max(1, lead // 2) and frames + 8 <= 1025:
+                frames += 8
+            if lead and frames - 1 - span >= 1:
+                # the lead-in takes up the rounding to 8n+1, so every cycle keeps the motion's exact length
+                lead = frames - 1 - span
         lead = min(lead, frames - 9)
         span = frames - 1 - lead  # frames covered by the cycles; frame `frames - 1` repeats the cycle start
 
