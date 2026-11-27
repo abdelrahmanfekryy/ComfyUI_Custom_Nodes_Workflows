@@ -9,6 +9,7 @@ from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 
 from .iclora import AddICLoRAGuideLTX, CropGuidesLTX, ICLoRALoaderLTX
+from .motion_io import LoadSpriteMotion, SaveSpriteMotion, SpriteMotionFromVideo
 from .pose_loop import SpritePoseLoop
 
 THUMB = 64  # long side of the thumbnails used to compare poses
@@ -111,7 +112,8 @@ class SpriteLoopFrames(io.ComfyNode):
 class SpriteToolsExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [SpriteLoopFrames, SpritePoseLoop, ICLoRALoaderLTX, AddICLoRAGuideLTX, CropGuidesLTX]
+        return [SpriteLoopFrames, SpritePoseLoop, ICLoRALoaderLTX, AddICLoRAGuideLTX, CropGuidesLTX,
+                SpriteMotionFromVideo, SaveSpriteMotion, LoadSpriteMotion]
 
 
 async def comfy_entrypoint() -> SpriteToolsExtension:
