@@ -3,6 +3,9 @@
 A motion file holds the body keypoints (OpenPose 18-point, video pixel coords) of exactly one cycle, already
 smoothed and closed into a loop: the frame after the last one would be the first one again. Sprite Pose Loop
 retargets it onto any character, so a motion is extracted once and reused.
+
+Saving and opening go through the browser (web/sprite_motion.js): Save Sprite Motion hands the file to the page,
+which asks where to save it; Load Sprite Motion's button uploads a chosen file into input/sprite_motions/.
 """
 import json
 import logging
@@ -12,28 +15,54 @@ import numpy as np
 import torch
 
 import folder_paths
-from comfy_api.latest import io, ui
+from comfy_api.latest import io
 
 from .pose_loop import (CYCLE_DETECT, CYCLE_WHOLE, MIRROR_OFF, _fill_and_smooth, _Rig, _sample, _video_track,
                         _VideoMotion)
 
-MOTION_DIR = "sprite_motions"  # under the output folder
+MOTION_DIR = "sprite_motions"  # Load Sprite Motion's folder under input/ (uploads); older saves under output/
+OUTPUT_TAG = " [output]"
 NONE = "(none)"
 TARGET_FPS = 24  # the LTX sprite workflow's frame rate
 
 
-def _motion_dir():
-    return os.path.join(folder_paths.get_output_directory(), MOTION_DIR)
-
-
-def _motion_files():
-    root = _motion_dir()
+def _json_files(root):
     found = []
     for base, _dirs, files in os.walk(root):
         for name in files:
             if name.lower().endswith(".json"):
                 found.append(os.path.relpath(os.path.join(base, name), root).replace(os.sep, "/"))
     return sorted(found)
+
+
+def _motion_files():
+    """Files opened into input/sprite_motions, then older saves in output/sprite_motions (tagged)."""
+    files = _json_files(os.path.join(folder_paths.get_input_directory(), MOTION_DIR))
+    files += [f + OUTPUT_TAG for f in _json_files(os.path.join(folder_paths.get_output_directory(), MOTION_DIR))]
+    return files
+
+
+def _motion_path(name):
+    if name.endswith(OUTPUT_TAG):
+        return os.path.join(folder_paths.get_output_directory(), MOTION_DIR, name[:-len(OUTPUT_TAG)])
+    return os.path.join(folder_paths.get_input_directory(), MOTION_DIR, name)
+
+
+def _motion_json(motion):
+    """POSE_KEYPOINT cycle -> the motion file's JSON text."""
+    track, w, h = _from_pose_keypoint(motion)
+    meta = dict(motion[0].get("sprite_motion") or {})
+    if not meta.get("cycle"):
+        raise ValueError("this motion is not a single cycle: connect Sprite Motion from Video's `motion`")
+    data = {
+        "sprite_motion": 1,
+        "canvas_width": w, "canvas_height": h,
+        "frame_count": int(track.shape[0]),
+        **{k: v for k, v in meta.items() if k not in ("cycle", "file")},
+        # one row per frame: x0, y0, x1, y1, ... for the 18 OpenPose body joints; null = not detected
+        "frames": [[None if not np.isfinite(v) else round(float(v), 2) for v in pts.reshape(-1)] for pts in track],
+    }
+    return json.dumps(data, separators=(",", ":")), int(track.shape[0])
 
 
 def _to_pose_keypoint(frames, w, h, meta):
@@ -138,39 +167,26 @@ class SaveSpriteMotion(io.ComfyNode):
             node_id="SaveSpriteMotion",
             display_name="Save Sprite Motion",
             category="image/sprites",
-            description=f"Saves a motion cycle as JSON in output/{MOTION_DIR}/, where Load Sprite Motion finds it.",
+            description="After a run, press 'Save motion as...' on this node and pick where to save the motion "
+                        "file (.json). Nothing is written to the server's folders. Open it again with Load Sprite "
+                        "Motion's 'Open motion file...'.",
             inputs=[
                 io.Custom("POSE_KEYPOINT").Input("motion"),
-                io.String.Input("name", default="walk", tooltip="File name prefix; a counter is added. A '/' makes "
-                                                                 "a subfolder."),
+                io.String.Input("name", default="walk", tooltip="Suggested file name in the save window."),
             ],
-            outputs=[io.String.Output(display_name="file")],
+            outputs=[],
             is_output_node=True,
         )
 
     @classmethod
     def execute(cls, motion, name) -> io.NodeOutput:
-        track, w, h = _from_pose_keypoint(motion)
-        meta = dict(motion[0].get("sprite_motion") or {})
-        if not meta.get("cycle"):
-            raise ValueError("this motion is not a single cycle: connect Sprite Motion from Video's `motion`")
-        folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
-            f"{MOTION_DIR}/{name.strip() or 'motion'}", folder_paths.get_output_directory())
-        os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, f"{filename}_{counter:05}_.json")
-        data = {
-            "sprite_motion": 1,
-            "canvas_width": w, "canvas_height": h,
-            "frame_count": int(track.shape[0]),
-            **{k: v for k, v in meta.items() if k != "cycle"},
-            # one row per frame: x0, y0, x1, y1, ... for the 18 OpenPose body joints; null = not detected
-            "frames": [[None if not np.isfinite(v) else round(float(v), 2) for v in pts.reshape(-1)] for pts in track],
-        }
-        with open(path, "w") as f:
-            json.dump(data, f, separators=(",", ":"))
-        rel = os.path.relpath(path, _motion_dir()).replace(os.sep, "/")
-        logging.info("SaveSpriteMotion: saved %s", path)
-        return io.NodeOutput(rel, ui=ui.PreviewText(f"saved {MOTION_DIR}/{rel} ({track.shape[0]} frames)"))
+        text, count = _motion_json(motion)
+        filename = (name.strip() or "motion").replace("/", "_").replace("\\", "_")
+        if not filename.lower().endswith(".json"):
+            filename += ".json"
+        # the browser extension (web/sprite_motion.js) keeps this and writes it where the user chooses
+        return io.NodeOutput(ui={"sprite_motion": [text], "sprite_motion_name": [filename],
+                                 "sprite_motion_frames": [count]})
 
 
 class LoadSpriteMotion(io.ComfyNode):
@@ -180,11 +196,13 @@ class LoadSpriteMotion(io.ComfyNode):
             node_id="LoadSpriteMotion",
             display_name="Load Sprite Motion",
             category="image/sprites",
-            description=f"Loads a motion cycle saved by Save Sprite Motion (output/{MOTION_DIR}/), for Sprite Pose "
-                        "Loop's video_pose. Press R in the editor to refresh the list after saving a new one.",
+            description="Loads a motion cycle saved by Save Sprite Motion, for Sprite Pose Loop's video_pose. "
+                        f"Press 'Open motion file...' to pick a .json anywhere; it is copied to input/{MOTION_DIR}/ "
+                        "and listed here.",
             inputs=[
                 io.Combo.Input("motion_file", options=[NONE] + _motion_files(), default=NONE,
-                               tooltip=f"Files in output/{MOTION_DIR}/."),
+                               tooltip=f"Motion files opened before (input/{MOTION_DIR}/; '[output]' = "
+                                       f"output/{MOTION_DIR}/)."),
             ],
             outputs=[
                 io.Custom("POSE_KEYPOINT").Output(display_name="motion"),
@@ -194,20 +212,20 @@ class LoadSpriteMotion(io.ComfyNode):
 
     @classmethod
     def fingerprint_inputs(cls, motion_file):
-        path = os.path.join(_motion_dir(), motion_file)
+        path = _motion_path(motion_file)
         return os.path.getmtime(path) if os.path.isfile(path) else motion_file
 
     @classmethod
     def validate_inputs(cls, motion_file):
-        if motion_file != NONE and not os.path.isfile(os.path.join(_motion_dir(), motion_file)):
-            return f"motion file not found: output/{MOTION_DIR}/{motion_file}"
+        if motion_file != NONE and not os.path.isfile(_motion_path(motion_file)):
+            return f"motion file not found: {motion_file}"
         return True
 
     @classmethod
     def execute(cls, motion_file) -> io.NodeOutput:
         if motion_file == NONE:
             return io.NodeOutput(None, 0)
-        with open(os.path.join(_motion_dir(), motion_file)) as f:
+        with open(_motion_path(motion_file)) as f:
             data = json.load(f)
         if data.get("sprite_motion") != 1:
             raise ValueError(f"{motion_file} is not a sprite motion file")

@@ -116,5 +116,8 @@ class SpriteToolsExtension(ComfyExtension):
                 SpriteMotionFromVideo, SaveSpriteMotion, LoadSpriteMotion]
 
 
+WEB_DIRECTORY = "./web"  # Save as / Open buttons for sprite motion files
+
+
 async def comfy_entrypoint() -> SpriteToolsExtension:
     return SpriteToolsExtension()
