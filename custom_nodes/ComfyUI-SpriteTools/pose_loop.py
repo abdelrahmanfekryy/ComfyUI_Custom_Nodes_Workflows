@@ -40,6 +40,8 @@ ANKLES = [R_ANK, L_ANK]
 # limb bones whose direction comes from the video, parent first (parents are placed before children)
 LIMB_BONES = [(R_SHO, R_ELB), (R_ELB, R_WRI), (L_SHO, L_ELB), (L_ELB, L_WRI),
               (R_HIP, R_KNE), (R_KNE, R_ANK), (L_HIP, L_KNE), (L_KNE, L_ANK)]
+# left/right limb pairs that DWPose can mix up
+LR_GROUPS = [((R_KNE, R_ANK), (L_KNE, L_ANK)), ((R_ELB, R_WRI), (L_ELB, L_WRI))]
 # right <-> left, for mirroring a video
 LR_SWAP = [0, 1, 5, 6, 7, 2, 3, 4, 11, 12, 13, 8, 9, 10, 15, 14, 17, 16]
 
@@ -279,8 +281,129 @@ def _is_saved_motion(video_pose):
     return isinstance(first, dict) and bool((first.get("sprite_motion") or {}).get("cycle"))
 
 
-def _fill_and_smooth(track, sigma):
-    """Interpolate missing joints over time, then Gaussian-smooth each joint (sigma in frames)."""
+def _body_height(track):
+    """Median height of the detected body over the clip, in pixels."""
+    heights = [np.ptp(f[np.isfinite(f[:, 1]), 1]) for f in track if np.isfinite(f[:, 1]).sum() > 1]
+    return max(float(np.median(heights)), 1.0) if heights else 1.0
+
+
+def _fix_left_right(track, cyclic):
+    """Undo DWPose's left/right mix-ups (common in side views, where the legs cross).
+
+    For legs (knee + ankle) and arms (elbow + wrist) separately, picks per frame whether to swap the left and
+    right labels so each limb keeps moving the way it was going: each frame is compared with the constant-
+    velocity prediction from the two before it, which tells limbs that pass each other from limbs that bounce
+    back. It's a shortest path over the clip (for a looping clip, wrapping from the last frame to the first).
+    Of the two labelings that come out (flipping every frame costs the same), keeps the one closer to
+    DWPose's own. Returns the track and the number of limb swaps made.
+    """
+    out = track.copy()
+    m = len(out)
+    swaps = 0
+    if m < 4:
+        return out, 0
+    cap = 0.1 * _body_height(track)  # one bad joint can't outweigh the rest
+    for right, left in LR_GROUPS:
+        r, l = list(right), list(left)
+        both = np.stack([np.concatenate([track[:, r], track[:, l]], axis=1),
+                         np.concatenate([track[:, l], track[:, r]], axis=1)])  # [state, frame, joint, xy]
+
+        def miss(pred, i, s):
+            d = np.linalg.norm(both[s, i] - pred, axis=-1)
+            d = np.minimum(d[np.isfinite(d)], cap)
+            return float(d.sum()) if len(d) else 0.0
+
+        def cost2(i0, i1, i2, a, b, c):  # frame i2 in state c, against the motion of i0 (a) -> i1 (b)
+            return miss(2 * both[b, i1] - both[a, i0], i2, c)
+
+        best_total, best_states = np.inf, None
+        for s1 in ((0, 1) if cyclic else (None,)):
+            # acc[a, b]: best cost with frame i-1 in state a and frame i in state b; frame 0 is state 0
+            acc = np.full((2, 2), np.inf)
+            for b in (0, 1):
+                if s1 is None or b == s1:
+                    acc[0, b] = miss(both[0, 0], 1, b)
+            backs = []
+            for i in range(2, m):
+                new_acc = np.full((2, 2), np.inf)
+                back = np.zeros((2, 2), dtype=int)
+                for b in (0, 1):
+                    for c in (0, 1):
+                        options = [acc[a, b] + cost2(i - 2, i - 1, i, a, b, c) for a in (0, 1)]
+                        back[b, c] = int(np.argmin(options))
+                        new_acc[b, c] = min(options)
+                acc = new_acc
+                backs.append(back)
+            if cyclic:  # the motion must also carry on into frames 0 and 1
+                for a in (0, 1):
+                    for b in (0, 1):
+                        acc[a, b] += cost2(m - 2, m - 1, 0, a, b, 0) + cost2(m - 1, 0, 1, b, 0, s1)
+            a, b = np.unravel_index(int(np.argmin(acc)), acc.shape)
+            if acc[a, b] < best_total:
+                states = [0] * m
+                states[m - 2], states[m - 1] = int(a), int(b)
+                for i in range(m - 1, 1, -1):
+                    states[i - 2] = int(backs[i - 2][states[i - 1], states[i]])
+                best_total, best_states = acc[a, b], np.array(states)
+        states = best_states
+        if states.sum() > m / 2:
+            states = 1 - states
+        flip = states == 1
+        out[np.ix_(flip, r)], out[np.ix_(flip, l)] = track[np.ix_(flip, l)], track[np.ix_(flip, r)]
+        swaps += int(flip.sum())
+    return out, swaps
+
+
+def _reject_outliers(track, cyclic):
+    """Drop joints that jump away from where their neighbouring frames put them (misdetections such as both
+    ankles on the same foot); they are interpolated again later. Returns the track and how many were dropped.
+    """
+    out = track.copy()
+    m = len(out)
+    if m < 4:
+        return out, 0
+    size = _body_height(track)
+    dropped = 0
+
+    def deviations(j):
+        """Distance of each frame's joint j from the line between its nearest valid neighbours."""
+        ok = np.flatnonzero(np.isfinite(out[:, j, 0]))
+        dev = np.full(m, np.nan)
+        if len(ok) < 3:
+            return dev
+        for k, i in enumerate(ok):
+            if cyclic:
+                p, n = ok[k - 1], ok[(k + 1) % len(ok)]
+                tp, tn = (p if p < i else p - m), (n if n > i else n + m)
+            elif 0 < k < len(ok) - 1:
+                p, n = ok[k - 1], ok[k + 1]
+                tp, tn = p, n
+            else:
+                continue
+            pred = out[p, j] + (out[n, j] - out[p, j]) * (i - tp) / (tn - tp)
+            dev[i] = np.linalg.norm(out[i, j] - pred)
+        return dev
+
+    for j in range(out.shape[1]):
+        dev = deviations(j)
+        if not np.isfinite(dev).any():
+            continue
+        limit = max(0.08 * size, 4.0 * float(np.nanmedian(dev)))
+        for _ in range(m // 4):
+            if not np.isfinite(dev).any():
+                break
+            i = int(np.nanargmax(dev))
+            if dev[i] <= limit:
+                break
+            out[i, j] = np.nan
+            dropped += 1
+            dev = deviations(j)
+    return out, dropped
+
+
+def _fill_and_smooth(track, sigma, cyclic=False):
+    """Interpolate missing joints over time, then Gaussian-smooth each joint (sigma in frames). A cyclic track
+    (one loop: the frame after the last is the first) wraps around in both."""
     m = track.shape[0]
     t = np.arange(m)
     out = track.copy()
@@ -289,12 +412,15 @@ def _fill_and_smooth(track, sigma):
         if not ok.any():
             continue  # never seen: stays NaN, retargeting falls back to the reference pose
         for c in range(2):
-            out[:, j, c] = np.interp(t, t[ok], track[ok, j, c])
+            out[:, j, c] = np.interp(t, t[ok], track[ok, j, c], period=m if cyclic else None)
     if sigma > 0 and m > 1:
         r = max(1, int(math.ceil(3 * sigma)))
         k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
         k /= k.sum()
-        padded = np.pad(out, ((r, r), (0, 0), (0, 0)), mode="edge")
+        if cyclic:
+            padded = out[np.arange(-r, m + r) % m]
+        else:
+            padded = np.pad(out, ((r, r), (0, 0), (0, 0)), mode="edge")
         sm = np.zeros_like(out)
         for i, kv in enumerate(k):
             sm += kv * padded[i:i + m]
@@ -358,8 +484,14 @@ class _VideoMotion:
             track = track[:, LR_SWAP].copy()
             track[..., 0] = width - track[..., 0]
 
-        v = _fill_and_smooth(track, smoothing)
-        self.track = v  # the video's own keypoints: gaps filled, smoothed, mirrored if asked
+        # one cycle given as the whole clip: the frame after the last is the first again
+        self.cyclic = self.saved or cycle_mode == CYCLE_WHOLE
+        self.swaps = self.dropped = 0
+        if not self.saved:
+            track, self.swaps = _fix_left_right(track, self.cyclic)
+            track, self.dropped = _reject_outliers(track, self.cyclic)
+        v = _fill_and_smooth(track, smoothing, self.cyclic)
+        self.track = v  # the video's own keypoints: labels fixed, gaps filled, smoothed, mirrored if asked
         m = v.shape[0]
         hips = v[:, [R_HIP, L_HIP]]
         vroot = np.nanmean(hips, axis=1)  # mid-hip, or the one hip that was seen
@@ -437,7 +569,16 @@ class _VideoMotion:
         q = self.rel.copy()
         q[..., 1] -= self.height[:, None]  # include how high the body is
         self.desc = q[:, rig.valid] / rig.size  # pose descriptor for matching, in body heights
+        self.loops_back = False
         self.start, self.period, self.score = self._find_cycle(cycle_mode)
+        self.auto_loop = False
+        if self.no_cycle is not None and not self.cyclic:
+            # No repeat inside the clip. If, cleaned up as one loop (left/right fixes and gap filling wrapping
+            # around), its end leads back into its start, then the clip is one loop: use that.
+            loop = _VideoMotion(rig, video_pose, mirror, smoothing, amplitude, CYCLE_WHOLE, pin_feet)
+            if loop.loops_back:
+                self.__dict__.update(loop.__dict__)
+                self.auto_loop = True
 
         # resample one cycle (its length can be fractional) and spread the remaining mismatch between its end
         # and its start over the cycle, so it loops without a jump. Root x is also centered on the reference.
@@ -449,17 +590,24 @@ class _VideoMotion:
         def looped(x):
             if self.saved:  # frame m would be frame 0 again: nothing to resample or close
                 return x.copy()
-            c = _sample(x, pos)
+            c = _sample(self.cycle_source(x), pos)
             return c[:-1] - (c[-1] - c[0]) * ramp.reshape((-1,) + (1,) * (c.ndim - 1))
         self.cyc_rel = looped(self.rel)
         self.cyc_x = looped(self.root_x)
         self.cyc_x -= self.cyc_x.mean()
         self.cyc_h = looped(self.height)
 
+    def cycle_source(self, x):
+        """x, with frame 0 appended when the cycle wraps past the last frame of a looping clip."""
+        if self.cyclic and self.start + self.period > len(x) - 1:
+            return np.concatenate([x, x[:1]])
+        return x
+
     def _whole(self, d):
         """The whole clip as one cycle. When its last frame repeats the first, that frame is the next cycle's."""
         m = d.shape[0]
         steps = np.diagonal(d, 1)
+        self.loops_back = m > 2 and d[0, m - 1] <= 2.5 * np.median(steps)
         n = m - 1 if m > 2 and d[0, m - 1] <= np.median(steps) else m
         return 0, float(n), math.nan
 
@@ -689,6 +837,10 @@ class SpritePoseLoop(io.ComfyNode):
                          f"{'mirrored, ' if vm.mirrored else ''}cycle = video frames {vm.start}-"
                          f"{vm.start + vm.period:.1f} ({vm.period:.1f} frames")
                 cycle += f", match {vm.score:.2f})" if math.isfinite(vm.score) else ")"
+                if vm.auto_loop:
+                    cycle += "; the clip is one loop (its end leads back into its start)"
+                if vm.swaps or vm.dropped:
+                    cycle += f"; fixed {vm.swaps} left/right limb swaps, {vm.dropped} misplaced joints"
             if vm.no_cycle is not None:
                 cycle += (f"; no repeating cycle found ({vm.no_cycle}), so the whole video is used as one cycle: "
                           f"trim it to one cycle, or use a clip with several")

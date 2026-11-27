@@ -19,6 +19,7 @@ from .pose_loop import (CYCLE_DETECT, CYCLE_WHOLE, MIRROR_OFF, _fill_and_smooth,
 
 MOTION_DIR = "sprite_motions"  # under the output folder
 NONE = "(none)"
+TARGET_FPS = 24  # the LTX sprite workflow's frame rate
 
 
 def _motion_dir():
@@ -72,17 +73,20 @@ class SpriteMotionFromVideo(io.ComfyNode):
                                        "or take the whole clip as one cycle (already trimmed to a loop)."),
                 io.Float.Input("smoothing", default=1.0, min=0.0, max=10.0, step=0.1,
                                tooltip="Removes DWPose jitter (Gaussian, in frames). 0 = off."),
+                io.Float.Input("fps", default=24.0, min=1.0, max=240.0, step=0.01,
+                               tooltip="Frame rate the video was loaded at (connect Video Info's fps). The "
+                                       "cycle is resampled to 24 fps, the sprite workflow's rate."),
             ],
             outputs=[
                 io.Custom("POSE_KEYPOINT").Output(display_name="motion"),
                 io.Image.Output(display_name="preview", tooltip="The cycle's skeleton; loop it to check the seam."),
-                io.Int.Output(display_name="frames", tooltip="Frames in the cycle (at the video's frame rate)."),
+                io.Int.Output(display_name="frames", tooltip="Frames in the cycle, at 24 fps."),
                 io.String.Output(display_name="info"),
             ],
         )
 
     @classmethod
-    def execute(cls, video_pose, video_cycle, smoothing) -> io.NodeOutput:
+    def execute(cls, video_pose, video_cycle, smoothing, fps=24.0) -> io.NodeOutput:
         frames = video_pose if isinstance(video_pose, list) else [video_pose]
         w, h = int(frames[0]["canvas_width"]), int(frames[0]["canvas_height"])
 
@@ -97,17 +101,24 @@ class SpriteMotionFromVideo(io.ComfyNode):
         rig = _Rig(np.nan_to_num(filled[k]), valid, None, [None, None])
 
         vm = _VideoMotion(rig, frames, MIRROR_OFF, smoothing, 1.0, video_cycle, False)
-        a, n, count = vm.start, vm.period, vm.samples
+        a, n = vm.start, vm.period
+        count = max(2, round(n * TARGET_FPS / fps))
         pos = a + np.arange(count + 1) * n / count  # last one = the start of the next cycle
-        c = _sample(vm.track, pos)
+        c = _sample(vm.cycle_source(vm.track), pos)
         cycle = c[:-1] - (c[-1] - c[0]) * (np.arange(count) / count)[:, None, None]  # close the loop
 
-        meta = {"cycle": True, "source_frames": [int(a), round(float(a + n), 2)], "smoothing": float(smoothing)}
+        meta = {"cycle": True, "fps": TARGET_FPS, "source_frames": [int(a), round(float(a + n), 2)],
+                "source_fps": float(fps), "smoothing": float(smoothing)}
         motion = _to_pose_keypoint(cycle, w, h, meta)
         preview = np.stack([rig.render(np.nan_to_num(p), w, h) for p in cycle])
 
-        info = (f"{vm.frames_in} video frames ({vm.detected} with a person); cycle = video frames {a}-{a + n:.1f}, "
-                f"saved as {count} frames")
+        info = (f"{vm.frames_in} video frames at {fps:g} fps ({vm.detected} with a person); cycle = video frames "
+                f"{a}-{a + n:.1f}, saved as {count} frames at {TARGET_FPS} fps")
+        if vm.auto_loop:
+            info += "\nthe clip is one loop (its end leads back into its start), used whole"
+        if vm.swaps or vm.dropped:
+            info += (f"\nfixed DWPose errors: {vm.swaps} left/right limb swaps, {vm.dropped} misplaced joints "
+                     f"re-interpolated")
         if np.isfinite(vm.score):
             info += f"; match {vm.score:.2f} (good is < 0.3)"
         if vm.no_cycle is not None:
